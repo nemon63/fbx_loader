@@ -381,32 +381,75 @@ main()
 
 
 def process_models_optimized(models, parent_node, matnet, folder_path, texture_files, texture_keywords, material_cache, models_info, settings=None, logger=None):
-    """Оптимизированная обработка списка моделей"""
+    """Оптимизированная обработка списка моделей с UDIM детектором"""
     
     if not models:
         print("Нет моделей для обработки")
         return
     
+    # ============================================================================
+    # НОВОЕ: АВТОМАТИЧЕСКИЙ АНАЛИЗ UDIM В НАЧАЛЕ ОБРАБОТКИ
+    # ============================================================================
+    
+    from material_utils import SmartUDIMDetector
+    
+    print("🔍 Анализ проекта на наличие UDIM текстур...")
+    udim_analysis = SmartUDIMDetector.analyze_project_udim(folder_path)
+    
+    # Добавляем результаты анализа в настройки
+    if settings:
+        settings.udim_detected = udim_analysis['has_udim']
+        settings.udim_confidence = udim_analysis['confidence']
+        settings.udim_sequences = udim_analysis['udim_sequences']
+        settings.udim_analysis = udim_analysis  # Полные результаты
+    
+    # Логирование результатов
+    if udim_analysis['has_udim']:
+        print(f"✅ UDIM текстуры обнаружены (уверенность: {udim_analysis['confidence']})")
+        print(f"   📁 Проанализировано папок: {len(udim_analysis.get('folders_analyzed', []))}")
+        print(f"   🎯 Найдено UDIM последовательностей: {len(udim_analysis['udim_sequences'])}")
+        
+        for base_name, sequence in udim_analysis['udim_sequences'].items():
+            texture_type = get_texture_type_by_filename(base_name)  # Используем функцию из constants.py
+            print(f"   - {base_name} ({texture_type}): {len(sequence)} тайлов ({min(sequence)}-{max(sequence)})")
+        
+        if logger:
+            logger.log_info(f"UDIM analysis: {len(udim_analysis['udim_sequences'])} sequences, confidence: {udim_analysis['confidence']}")
+            logger.log_debug(f"UDIM folders analyzed: {udim_analysis.get('folders_analyzed', [])}")
+    else:
+        print("ℹ️ UDIM текстуры не обнаружены, используется обычный режим")
+        if logger:
+            logger.log_info("No UDIM textures detected, using regular texture mode")
+    
+    # ============================================================================
+    # ПРОДОЛЖАЕМ СУЩЕСТВУЮЩУЮ ЛОГИКУ ОБРАБОТКИ
+    # ============================================================================
+    
     processor = ModelProcessor(logger, settings)
     material_type = getattr(settings, 'material_type', "principledshader")
     
-    batch_size = 15  # Уменьшаем размер батча для лучшей производительности
+    batch_size = 15
     total_models = len(models)
     
     processor.log_debug(f"Начинаем оптимизированную обработку {total_models} моделей")
     
-    # Обрабатываем модели батчами
+    # В лог добавляем информацию о режиме UDIM
+    if hasattr(settings, 'udim_detected'):
+        mode_info = "UDIM режим" if settings.udim_detected else "Обычный режим"
+        processor.log_debug(f"Режим текстур: {mode_info}")
+    
+    # Обрабатываем модели батчами (существующая логика)
     for batch_start in range(0, total_models, batch_size):
         batch_end = min(batch_start + batch_size, total_models)
         batch_models = models[batch_start:batch_end]
         
         processor.log_debug(f"Обработка батча {batch_start//batch_size + 1}: модели {batch_start+1}-{batch_end}")
         
-        # Обрабатываем модели в батче
         for model_idx, model_file in enumerate(batch_models):
             global_idx = batch_start + model_idx
             
             try:
+                # В _process_single_model_optimized теперь будет передана информация о UDIM через settings
                 success = _process_single_model_optimized(
                     model_file, parent_node, matnet, folder_path, texture_files,
                     texture_keywords, material_cache, models_info, material_type,
@@ -429,13 +472,18 @@ def process_models_optimized(models, parent_node, matnet, folder_path, texture_f
                 processor.failed_count += 1
                 continue
         
-        # Пауза между батчами
         if batch_end < total_models:
             time.sleep(0.02)
     
-    # Финальная статистика
+    # Финальная статистика с информацией о UDIM
     total_time = time.time() - processor.start_time
-    processor.log_debug(f"Оптимизированная обработка завершена за {total_time:.2f}с. Успешно: {processor.processed_count}, Ошибок: {processor.failed_count}")
+    stats_msg = f"Оптимизированная обработка завершена за {total_time:.2f}с. Успешно: {processor.processed_count}, Ошибок: {processor.failed_count}"
+    
+    if hasattr(settings, 'udim_detected') and settings.udim_detected:
+        stats_msg += f". UDIM: {len(settings.udim_sequences)} последовательностей"
+    
+    processor.log_debug(stats_msg)
+    print(stats_msg)
 
 
 def _process_single_model_optimized(model_file, parent_node, matnet, folder_path, texture_files, 

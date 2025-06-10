@@ -5,6 +5,8 @@ import hou
 import os
 import re
 from utils import clean_node_name, generate_unique_name
+from collections import defaultdict
+from constants import UDIM_CONFIG, ENHANCED_TEXTURE_KEYWORDS, is_udim_filename, extract_udim_info, get_texture_type_by_filename
 
 # Импорт UDIM поддержки
 try:
@@ -63,6 +65,276 @@ ENHANCED_TEXTURE_KEYWORDS = {
         "Specular", "SpecularMap", "Reflection", "_specular", "_spec"
     ]
 }
+
+
+
+
+class SmartUDIMDetector:
+    """
+    Умный UDIM детектор, использующий существующую конфигурацию из constants.py
+    """
+    
+    @classmethod
+    def detect_udim_in_folder(cls, folder_path):
+        """Определяет UDIM текстуры в папке используя конфигурацию из constants.py"""
+        if not os.path.exists(folder_path):
+            return cls._empty_result()
+        
+        try:
+            files = [f for f in os.listdir(folder_path) 
+                    if os.path.isfile(os.path.join(folder_path, f))]
+            
+            udim_sequences = defaultdict(list)
+            regular_textures = []
+            
+            # Анализ каждого файла используя функции из constants.py
+            for filename in files:
+                if is_udim_filename(filename):
+                    udim_info = extract_udim_info(filename)
+                    if udim_info:
+                        base_name = udim_info['base_name']
+                        udim_number = udim_info['udim_number']
+                        
+                        # Проверяем, что UDIM номер в допустимом диапазоне
+                        if UDIM_CONFIG['range_start'] <= udim_number <= UDIM_CONFIG['range_end']:
+                            udim_sequences[base_name].append(udim_number)
+                        else:
+                            regular_textures.append(filename)
+                    else:
+                        regular_textures.append(filename)
+                else:
+                    regular_textures.append(filename)
+            
+            # Фильтрация по минимальному количеству тайлов
+            min_tiles = UDIM_CONFIG.get('min_tiles', 2)
+            valid_udim_sequences = {}
+            
+            for base_name, udim_numbers in udim_sequences.items():
+                if len(udim_numbers) >= min_tiles:
+                    valid_udim_sequences[base_name] = sorted(udim_numbers)
+            
+            has_udim = len(valid_udim_sequences) > 0
+            confidence = cls._calculate_confidence(valid_udim_sequences, regular_textures)
+            
+            return {
+                'has_udim': has_udim,
+                'udim_sequences': valid_udim_sequences,
+                'regular_textures': regular_textures,
+                'confidence': confidence,
+                'total_files': len(files),
+                'udim_files_count': sum(len(seq) for seq in valid_udim_sequences.values()),
+                'config_used': 'constants.py'
+            }
+            
+        except Exception as e:
+            print(f"Ошибка анализа UDIM в папке {folder_path}: {e}")
+            return cls._empty_result()
+    
+    @classmethod
+    def _calculate_confidence(cls, udim_sequences, regular_textures):
+        """Вычисляет уверенность в определении UDIM"""
+        if not udim_sequences:
+            return 0.0
+        
+        total_udim_files = sum(len(seq) for seq in udim_sequences.values())
+        total_files = total_udim_files + len(regular_textures)
+        
+        if total_files == 0:
+            return 0.0
+        
+        # Базовая уверенность
+        udim_ratio = total_udim_files / total_files
+        
+        # Бонус за качественные последовательности
+        quality_bonus = 0.0
+        for sequence in udim_sequences.values():
+            if len(sequence) >= 4:
+                quality_bonus += 0.2
+            elif len(sequence) >= 2:
+                quality_bonus += 0.1
+        
+        confidence = min(1.0, udim_ratio + quality_bonus)
+        return round(confidence, 2)
+    
+    @classmethod
+    def _empty_result(cls):
+        """Возвращает пустой результат"""
+        return {
+            'has_udim': False,
+            'udim_sequences': {},
+            'regular_textures': [],
+            'confidence': 0.0,
+            'total_files': 0,
+            'udim_files_count': 0,
+            'config_used': 'constants.py'
+        }
+    
+    @classmethod
+    def analyze_project_udim(cls, folder_path):
+        """
+        Анализирует весь проект на наличие UDIM
+        Ищет в стандартных папках: textures, maps, materials, tex
+        """
+        possible_texture_folders = [
+            folder_path,
+            os.path.join(folder_path, 'textures'),
+            os.path.join(folder_path, 'maps'), 
+            os.path.join(folder_path, 'materials'),
+            os.path.join(folder_path, 'tex'),
+            os.path.join(folder_path, 'assets'),
+            os.path.join(folder_path, 'images'),
+        ]
+        
+        combined_result = cls._empty_result()
+        folders_analyzed = []
+        
+        for texture_folder in possible_texture_folders:
+            if os.path.exists(texture_folder):
+                folder_result = cls.detect_udim_in_folder(texture_folder)
+                folders_analyzed.append(texture_folder)
+                
+                # Объединяем результаты
+                if folder_result['has_udim']:
+                    combined_result['has_udim'] = True
+                    combined_result['udim_sequences'].update(folder_result['udim_sequences'])
+                    combined_result['confidence'] = max(
+                        combined_result['confidence'], 
+                        folder_result['confidence']
+                    )
+                
+                combined_result['regular_textures'].extend(folder_result['regular_textures'])
+                combined_result['total_files'] += folder_result['total_files']
+                combined_result['udim_files_count'] += folder_result['udim_files_count']
+        
+        combined_result['folders_analyzed'] = folders_analyzed
+        return combined_result
+
+
+
+class MaterialManager:
+    def __init__(self, material_type="principled"):
+        self.material_type = material_type
+        self.udim_detector = SmartUDIMDetector()  # Добавляем детектор
+        
+    def auto_detect_and_assign_textures(self, material_node, texture_folder, force_udim=None):
+        """
+        Автоматически определяет UDIM и назначает текстуры
+        
+        Args:
+            material_node: Нода материала в Houdini
+            texture_folder: Папка с текстурами  
+            force_udim: None=авто, True=принудительно UDIM, False=без UDIM
+        """
+        
+        # 1. Автоматическое определение UDIM
+        if force_udim is None:
+            udim_info = self.udim_detector.detect_udim_in_folder(texture_folder)
+            use_udim = udim_info['has_udim']
+            
+            # Логирование результатов
+            if udim_info['has_udim']:
+                print(f"✅ UDIM текстуры обнаружены (уверенность: {udim_info['confidence']})")
+                print(f"   Найдено последовательностей: {len(udim_info['udim_sequences'])}")
+                for base_name, sequence in udim_info['udim_sequences'].items():
+                    print(f"   - {base_name}: {len(sequence)} тайлов ({min(sequence)}-{max(sequence)})")
+            else:
+                print(f"ℹ️ UDIM текстуры не обнаружены, используется обычный режим")
+        else:
+            use_udim = force_udim
+            udim_info = self.udim_detector.detect_udim_in_folder(texture_folder) if use_udim else None
+        
+        # 2. Назначение текстур в зависимости от режима
+        if use_udim and udim_info and udim_info['has_udim']:
+            return self._assign_udim_textures(material_node, texture_folder, udim_info)
+        else:
+            return self._assign_regular_textures(material_node, texture_folder)
+    
+    def _assign_udim_textures(self, material_node, texture_folder, udim_info):
+        """Назначает UDIM текстуры"""
+        assigned_count = 0
+        
+        for base_name, udim_sequence in udim_info['udim_sequences'].items():
+            # Определяем тип текстуры по базовому имени
+            texture_type = self.detect_texture_type(base_name)
+            
+            if texture_type != 'unknown':
+                # Создаем путь к UDIM последовательности  
+                first_udim = min(udim_sequence)
+                udim_path = self._build_udim_path(texture_folder, base_name, first_udim, udim_sequence)
+                
+                # Назначаем в материал
+                if self._assign_texture_to_material(material_node, texture_type, udim_path, is_udim=True):
+                    assigned_count += 1
+                    print(f"   ✅ {texture_type}: {os.path.basename(udim_path)} ({len(udim_sequence)} тайлов)")
+        
+        return assigned_count
+    
+    def _assign_regular_textures(self, material_node, texture_folder):
+        """Назначает обычные текстуры (без UDIM)"""
+        # Существующая логика назначения обычных текстур
+        return self.assign_textures_old_method(material_node, texture_folder)
+    
+    def _build_udim_path(self, texture_folder, base_name, first_udim, udim_sequence):
+        """Строит путь к UDIM текстуре"""
+        # Находим первый файл для определения паттерна
+        for filename in os.listdir(texture_folder):
+            if filename.startswith(base_name) and str(first_udim) in filename:
+                # Заменяем номер UDIM на маску <UDIM>
+                udim_path = os.path.join(texture_folder, filename)
+                udim_path = udim_path.replace(str(first_udim), '<UDIM>')
+                return udim_path
+        
+        # Fallback: создаем стандартный паттерн
+        extension = 'jpg'  # По умолчанию
+        return os.path.join(texture_folder, f"{base_name}.<UDIM>.{extension}")
+    
+    def _assign_texture_to_material(self, material_node, texture_type, texture_path, is_udim=False):
+        """Назначает текстуру в материал (с поддержкой UDIM)"""
+        try:
+            if self.material_type == "principled":
+                return self._assign_to_principled(material_node, texture_type, texture_path, is_udim)
+            elif self.material_type == "redshift":
+                return self._assign_to_redshift(material_node, texture_type, texture_path, is_udim)
+            else:
+                return self._assign_to_standard(material_node, texture_type, texture_path, is_udim)
+        except Exception as e:
+            print(f"❌ Ошибка назначения {texture_type}: {e}")
+            return False
+    
+    def _assign_to_principled(self, material_node, texture_type, texture_path, is_udim):
+        """Назначение в Principled Shader с поддержкой UDIM"""
+        # Создаем texture node
+        texture_node = material_node.createNode("file")
+        texture_node.setName(f"{texture_type}_tex")
+        texture_node.parm("filename").set(texture_path)
+        
+        # Включаем UDIM режим если нужно
+        if is_udim:
+            # Для Principled Shader включаем UDIM
+            if texture_node.parm("udim"):
+                texture_node.parm("udim").set(1)
+        
+        # Подключаем к соответствующему входу материала
+        principled = material_node.node("principledshader")
+        if not principled:
+            principled = material_node.createNode("principledshader")
+        
+        connection_map = {
+            'diffuse': 'basecolor',
+            'normal': 'normal', 
+            'roughness': 'rough',
+            'metallic': 'metallic',
+            'ao': 'occlusion',
+            'emissive': 'emissive'
+        }
+        
+        if texture_type in connection_map:
+            input_name = connection_map[texture_type]
+            if principled.parm(input_name):
+                principled.setNamedInput(input_name, texture_node, 0)
+                return True
+        
+        return False
 
 
 def find_matching_textures(material_name, texture_files, texture_keywords=None, model_basename=""):
@@ -1938,3 +2210,239 @@ def create_materialx_shader_fixed_v2(matnet_node, material_name, texture_maps, l
         import traceback
         log_error(traceback.format_exc())
         return None
+    
+    
+def assign_textures_to_material_smart(material_node, texture_folder, material_type, settings=None, logger=None):
+    """
+    Умное назначение текстур с автоматическим определением UDIM
+    Замена для существующих функций назначения материалов
+    """
+    try:
+        # Определяем режим UDIM
+        use_udim = False
+        udim_info = None
+        
+        # Проверяем настройки
+        if settings and hasattr(settings, 'udim_detected'):
+            use_udim = settings.udim_detected
+            udim_info = {
+                'udim_sequences': getattr(settings, 'udim_sequences', {}),
+                'confidence': getattr(settings, 'udim_confidence', 0.0)
+            }
+        else:
+            # Автоматическое определение если настройки не содержат информацию
+            udim_info = SmartUDIMDetector.detect_udim_in_folder(texture_folder)
+            use_udim = udim_info['has_udim']
+        
+        if logger:
+            logger.log_debug(f"Texture assignment mode: {'UDIM' if use_udim else 'Regular'}")
+        
+        # Назначаем текстуры в зависимости от режима
+        if use_udim and udim_info and udim_info.get('udim_sequences'):
+            return assign_udim_textures_to_material(material_node, texture_folder, material_type, udim_info, logger)
+        else:
+            # Используем существующую функцию для обычных текстур
+            return assign_textures_to_material_old(material_node, texture_folder, material_type, logger)
+            
+    except Exception as e:
+        error_msg = f"Ошибка при назначении текстур: {e}"
+        if logger:
+            logger.log_error(error_msg)
+        print(f"ERROR: {error_msg}")
+        return 0
+    
+def assign_udim_textures_to_material(material_node, texture_folder, material_type, udim_info, logger=None):
+    """
+    Назначение UDIM текстур в материал
+    """
+    assigned_count = 0
+    
+    try:
+        if logger:
+            logger.log_info(f"Assigning UDIM textures from: {texture_folder}")
+        
+        for base_name, udim_sequence in udim_info['udim_sequences'].items():
+            # Определяем тип текстуры
+            texture_type = detect_texture_type_from_name(base_name)
+            
+            if texture_type != 'unknown':
+                # Строим путь к UDIM последовательности
+                udim_path = build_udim_texture_path(texture_folder, base_name, udim_sequence)
+                
+                if udim_path and os.path.exists(udim_path.replace('<UDIM>', str(min(udim_sequence)))):
+                    # Назначаем текстуру
+                    if assign_single_texture_to_material(material_node, texture_type, udim_path, material_type, is_udim=True):
+                        assigned_count += 1
+                        print(f"   ✅ {texture_type}: {os.path.basename(udim_path)} ({len(udim_sequence)} тайлов)")
+                        if logger:
+                            logger.log_debug(f"Assigned UDIM texture: {texture_type} -> {udim_path}")
+                    else:
+                        print(f"   ❌ Не удалось назначить {texture_type}: {udim_path}")
+                        if logger:
+                            logger.log_warning(f"Failed to assign UDIM texture: {texture_type}")
+                else:
+                    print(f"   ⚠️ UDIM файл не найден: {base_name}")
+                    if logger:
+                        logger.log_warning(f"UDIM file not found: {base_name}")
+            else:
+                print(f"   ⚠️ Неизвестный тип текстуры: {base_name}")
+                if logger:
+                    logger.log_warning(f"Unknown texture type: {base_name}")
+        
+        return assigned_count
+        
+    except Exception as e:
+        error_msg = f"Ошибка при назначении UDIM текстур: {e}"
+        print(f"ERROR: {error_msg}")
+        if logger:
+            logger.log_error(error_msg)
+        return 0
+    
+def build_udim_texture_path(texture_folder, base_name, udim_sequence):
+    """
+    Строит корректный путь к UDIM текстуре
+    """
+    try:
+        # Ищем первый файл из последовательности для определения паттерна
+        first_udim = min(udim_sequence)
+        
+        # Проверяем разные паттерны именования
+        patterns = [
+            f"{base_name}.{first_udim}",      # texture.1001.jpg
+            f"{base_name}_{first_udim}",      # texture_1001.jpg
+            f"{base_name}-{first_udim}",      # texture-1001.jpg
+            f"{base_name}{first_udim}",       # texture1001.jpg
+        ]
+        
+        for pattern in patterns:
+            for ext in ['.jpg', '.jpeg', '.png', '.tga', '.tiff', '.exr']:
+                test_filename = pattern + ext
+                test_path = os.path.join(texture_folder, test_filename)
+                
+                if os.path.exists(test_path):
+                    # Заменяем номер UDIM на маску <UDIM>
+                    udim_path = test_path.replace(str(first_udim), '<UDIM>')
+                    return udim_path
+        
+        # Если не нашли, создаем стандартный путь
+        return os.path.join(texture_folder, f"{base_name}.<UDIM>.jpg")
+        
+    except Exception as e:
+        print(f"Ошибка при построении UDIM пути: {e}")
+        return None
+    
+def assign_textures_smart(material_node, texture_folder, material_type, settings=None, logger=None):
+    """
+    Умное назначение текстур с автоматическим определением UDIM
+    Используется вместо существующих функций назначения материалов
+    """
+    try:
+        # Определяем режим из настроек
+        use_udim = False
+        udim_sequences = {}
+        
+        if settings and hasattr(settings, 'udim_detected'):
+            use_udim = settings.udim_detected
+            udim_sequences = getattr(settings, 'udim_sequences', {})
+            
+            if logger:
+                mode = "UDIM" if use_udim else "Regular"
+                logger.log_debug(f"Texture assignment mode: {mode}")
+        else:
+            # Fallback: локальная проверка папки
+            from material_utils import SmartUDIMDetector
+            result = SmartUDIMDetector.detect_udim_in_folder(texture_folder)
+            use_udim = result['has_udim']
+            udim_sequences = result['udim_sequences']
+        
+        assigned_count = 0
+        
+        if use_udim and udim_sequences:
+            print(f"   🎯 Назначение UDIM текстур: {len(udim_sequences)} последовательностей")
+            assigned_count = assign_udim_textures(material_node, texture_folder, material_type, udim_sequences, logger)
+        else:
+            print(f"   📄 Назначение обычных текстур")
+            # Используй твою существующую функцию назначения обычных текстур
+            assigned_count = assign_regular_textures_existing(material_node, texture_folder, material_type, logger)
+        
+        return assigned_count
+        
+    except Exception as e:
+        error_msg = f"Ошибка умного назначения текстур: {e}"
+        print(f"❌ {error_msg}")
+        if logger:
+            logger.log_error(error_msg)
+        return 0
+    
+def assign_udim_textures(material_node, texture_folder, material_type, udim_sequences, logger=None):
+    """Назначает UDIM текстуры в материал"""
+    assigned_count = 0
+    
+    try:
+        for base_name, udim_numbers in udim_sequences.items():
+            # Определяем тип текстуры используя функцию из constants.py
+            texture_type = get_texture_type_by_filename(base_name)
+            
+            if texture_type != "BaseMap":  # Если тип определен
+                # Строим UDIM путь
+                udim_path = build_udim_path(texture_folder, base_name, udim_numbers)
+                
+                if udim_path and assign_single_texture_udim(material_node, texture_type, udim_path, material_type):
+                    assigned_count += 1
+                    print(f"      ✅ {texture_type}: {os.path.basename(udim_path)} ({len(udim_numbers)} тайлов)")
+                    
+                    if logger:
+                        logger.log_debug(f"UDIM texture assigned: {texture_type} -> {udim_path}")
+                else:
+                    print(f"      ❌ Не удалось назначить {texture_type}: {base_name}")
+            else:
+                print(f"      ⚠️ Неизвестный тип: {base_name}")
+        
+        return assigned_count
+        
+    except Exception as e:
+        error_msg = f"Ошибка назначения UDIM текстур: {e}"
+        print(f"❌ {error_msg}")
+        if logger:
+            logger.log_error(error_msg)
+        return 0
+
+def build_udim_path(texture_folder, base_name, udim_numbers):
+    """Строит корректный UDIM путь используя конфигурацию"""
+    try:
+        first_udim = min(udim_numbers)
+        placeholder = UDIM_CONFIG.get('placeholder', '<UDIM>')
+        
+        # Ищем первый файл для определения точного паттерна
+        for filename in os.listdir(texture_folder):
+            if filename.startswith(base_name) and str(first_udim) in filename:
+                full_path = os.path.join(texture_folder, filename)
+                # Заменяем номер UDIM на плейсхолдер
+                udim_path = full_path.replace(str(first_udim), placeholder)
+                return udim_path
+        
+        # Fallback: создаем стандартный путь
+        return os.path.join(texture_folder, f"{base_name}.{placeholder}.jpg")
+        
+    except Exception as e:
+        print(f"Ошибка построения UDIM пути: {e}")
+        return None
+
+def assign_single_texture_udim(material_node, texture_type, texture_path, material_type):
+    """Назначает одну UDIM текстуру в материал"""
+    try:
+        # Создаем texture node
+        texture_node = material_node.createNode("file", f"{texture_type}_udim")
+        texture_node.parm("filename").set(texture_path)
+        
+        # Включаем UDIM режим
+        if texture_node.parm("udim"):
+            texture_node.parm("udim").set(1)
+            print(f"        UDIM режим включен для {texture_type}")
+        
+        # Подключаем к материалу (используй твою существующую логику подключения)
+        return connect_texture_to_material(texture_node, material_node, texture_type, material_type)
+        
+    except Exception as e:
+        print(f"Ошибка назначения UDIM текстуры {texture_type}: {e}")
+        return False

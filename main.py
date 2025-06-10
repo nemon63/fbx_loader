@@ -131,6 +131,26 @@ def create_multi_material_models_optimized(merge_models=False, settings=None, lo
             return
         
         texture_files = find_texture_files_optimized(folder_path, logger)
+
+        from material_utils import UDIMDetector
+
+        print("🔍 Анализ текстур на наличие UDIM...")
+        udim_info = UDIMDetector.get_udim_info_for_models(folder_path)
+
+        # Добавляем информацию о UDIM в настройки
+        if not hasattr(settings, 'udim_detected'):
+            settings.udim_detected = udim_info['has_udim']
+            settings.udim_confidence = udim_info['confidence']
+            settings.udim_sequences = udim_info['udim_sequences']
+
+        if udim_info['has_udim']:
+            print(f"✅ UDIM текстуры обнаружены (уверенность: {udim_info['confidence']})")
+            print(f"   Найдено последовательностей: {len(udim_info['udim_sequences'])}")
+            for base_name, sequence in udim_info['udim_sequences'].items():
+                print(f"   - {base_name}: {len(sequence)} тайлов ({min(sequence)}-{max(sequence)})")
+        else:
+            print("ℹ️ UDIM текстуры не обнаружены, используется обычный режим")       
+        
         
         # Создаем matnet
         material_type = getattr(settings, 'material_type', 'principledshader')
